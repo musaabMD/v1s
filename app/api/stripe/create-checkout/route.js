@@ -1,67 +1,100 @@
-import { createCheckout } from "@/libs/stripe";
-import { createClient } from "@/libs/supabase/server";
-import { NextResponse } from "next/server";
+import { createClient } from '@/libs/supabase/server';
+import Stripe from 'stripe';
+import { NextResponse } from 'next/server';
+
+if (!process.env.STRIPE_SECRET_KEY) {
+  throw new Error('STRIPE_SECRET_KEY is missing. Please add it to your .env.local file');
+}
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2023-10-16'
+});
 
 // This function is used to create a Stripe Checkout Session (one-time payment or subscription)
 // It's called by the <ButtonCheckout /> component
 // Users must be authenticated. It will prefill the Checkout data with their email and/or credit card (if any)
 export async function POST(req) {
-  const body = await req.json();
-
-  if (!body.priceId) {
-    return NextResponse.json(
-      { error: "Price ID is required" },
-      { status: 400 }
-    );
-  } else if (!body.successUrl || !body.cancelUrl) {
-    return NextResponse.json(
-      { error: "Success and cancel URLs are required" },
-      { status: 400 }
-    );
-  } else if (!body.mode) {
-    return NextResponse.json(
-      {
-        error:
-          "Mode is required (either 'payment' for one-time payments or 'subscription' for recurring subscription)",
-      },
-      { status: 400 }
-    );
-  }
-
   try {
     const supabase = createClient();
+    const { data: { user } } = await supabase.auth.getUser();
 
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
+    if (!user) {
+      return NextResponse.json(
+        { error: 'Unauthorized' },
+        { status: 401 }
+      );
+    }
 
-    const { priceId, mode, successUrl, cancelUrl } = body;
+    const body = await req.json();
+    const { examId } = body;
 
-    const { data } = await supabase
-      .from("profiles")
-      .select("*")
-      .eq("id", user?.id)
+    if (!examId) {
+      return NextResponse.json(
+        { error: 'Missing exam ID' },
+        { status: 400 }
+      );
+    }
+
+    console.log(`ℹ️ Creating checkout session for user ${user.id} and exam ${examId}`);
+
+    // Get exam details
+    const { data: exam, error: examError } = await supabase
+      .from('s_exams')
+      .select('*')
+      .eq('id', examId)
       .single();
 
-    const stripeSessionURL = await createCheckout({
-      priceId,
-      mode,
-      successUrl,
-      cancelUrl,
-      // If user is logged in, it will pass the user ID to the Stripe Session so it can be retrieved in the webhook later
-      clientReferenceId: user?.id,
-      user: {
-        email: data?.email,
-        // If the user has already purchased, it will automatically prefill it's credit card
-        customerId: data?.customer_id,
+    if (examError || !exam) {
+      console.error('❌ Error fetching exam:', examError);
+      return NextResponse.json(
+        { error: 'Exam not found' },
+        { status: 404 }
+      );
+    }
+
+    // Ensure we have a valid price
+    const price = exam.lifetime_price || exam.subscription_price || 49;
+    if (!price || isNaN(price)) {
+      return NextResponse.json(
+        { error: 'Invalid exam price' },
+        { status: 400 }
+      );
+    }
+
+    // Create Stripe checkout session
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [
+        {
+          price_data: {
+            currency: 'usd',
+            product_data: {
+              name: exam.name || 'Exam Access',
+              description: exam.description || 'Full exam access',
+            },
+            unit_amount: Math.round(price * 100), // Convert to cents and ensure it's an integer
+          },
+          quantity: 1,
+        },
+      ],
+      mode: 'payment',
+      success_url: `${process.env.NEXT_PUBLIC_SITE_URL}/dashboard/exams/${examId}?success=true`,
+      cancel_url: `${process.env.NEXT_PUBLIC_SITE_URL}/dashboard/exams/${examId}?canceled=true`,
+      metadata: {
+        user_id: user.id,
+        exam_id: examId,
+        user_email: user.email,
       },
-      // If you send coupons from the frontend, you can pass it here
-      // couponId: body.couponId,
+      customer_email: user.email,
     });
 
-    return NextResponse.json({ url: stripeSessionURL });
-  } catch (e) {
-    console.error(e);
-    return NextResponse.json({ error: e?.message }, { status: 500 });
+    console.log('✅ Checkout session created:', session.id);
+    return NextResponse.json({ url: session.url });
+  } catch (err) {
+    console.error('❌ Error creating checkout session:', err.message);
+    return NextResponse.json(
+      { error: err.message },
+      { status: 500 }
+    );
   }
 }
